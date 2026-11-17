@@ -1,1 +1,73 @@
+name: 偷故事的人 黑胶补货监控
 
+on:
+  schedule:
+    # GitHub 的 cron 一律按 UTC 计算。台湾时间 10:00 / 12:00 = UTC 02:00 / 04:00
+    - cron: "0 2,4 * * *"
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "只看结果，不发邮件、不写状态"
+        type: boolean
+        default: false
+
+# 需要写权限，才能把 state.json 和 monitor_log.md 提交回仓库
+permissions:
+  contents: write
+
+# 避免两次运行撞车导致 git push 失败
+concurrency:
+  group: vinyl-monitor
+  cancel-in-progress: false
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: 定位项目目录
+        id: locate
+        run: |
+          if [ -f monitor.py ]; then
+            echo "dir=." >> "$GITHUB_OUTPUT"
+          elif [ -f cloud-monitor/monitor.py ]; then
+            echo "dir=cloud-monitor" >> "$GITHUB_OUTPUT"
+          else
+            echo "::error::仓库里找不到 monitor.py，请确认文件已上传"
+            exit 1
+          fi
+
+      - name: 运行监控
+        working-directory: ${{ steps.locate.outputs.dir }}
+        env:
+          SMTP_HOST: ${{ secrets.SMTP_HOST }}
+          SMTP_PORT: ${{ secrets.SMTP_PORT }}
+          SMTP_USER: ${{ secrets.SMTP_USER }}
+          SMTP_PASS: ${{ secrets.SMTP_PASS }}
+          MAIL_TO: ${{ secrets.MAIL_TO }}
+        run: |
+          if [ "${{ inputs.dry_run }}" = "true" ]; then
+            python monitor.py --dry-run
+          else
+            python monitor.py
+          fi
+
+      - name: 提交状态文件
+        if: ${{ inputs.dry_run != true }}
+        working-directory: ${{ steps.locate.outputs.dir }}
+        run: |
+          git config user.name "vinyl-monitor-bot"
+          git config user.email "vinyl-monitor-bot@users.noreply.github.com"
+          git add state.json monitor_log.md 2>/dev/null || true
+          if git diff --cached --quiet; then
+            echo "状态无变化，跳过提交"
+          else
+            git commit -m "chore: 更新监控状态 $(TZ=Asia/Taipei date '+%Y-%m-%d %H:%M')"
+            git push
+          fi
