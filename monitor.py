@@ -12,13 +12,20 @@
           另外单独跟踪「出貨日期」，日期被改成新日期＝第二批开放预购的最早信号。
   - 佳佳：出现「無庫存」＝无货；该字样消失且出现购物车按钮＝有货。
 
-只在状态发生变化时发邮件，避免每天刷屏。
+只在状态发生变化时发邮件，避免刷屏。
 没配置 SMTP 环境变量时自动进入 dry-run，只打印不发信，方便本地测试。
 
+高频轮询（每分钟一次）下的写仓库策略：
+  - 状态有变化  → 立刻写日志 + 写状态，并让 workflow 提交（这是去重的锁，
+                  不提交的话下一分钟会拿旧状态再比一次，重复发信）
+  - 状态无变化  → 一天只在第一次运行时写一行「每日快照」，
+                  其余 1400 多次运行完全不碰仓库，不产生 commit
+
 用法：
-    python monitor.py              # 正常跑一次
-    python monitor.py --dry-run    # 只看结果，不发信，不写状态文件
-    python monitor.py --test-email # 发一封测试邮件，验证 SMTP 配置
+    python monitor.py                 # 正常跑一次
+    python monitor.py --dry-run        # 只看结果，不发信，不写状态文件
+    python monitor.py --test-email     # 发一封测试邮件，验证 SMTP 配置
+    python monitor.py --force-write    # 忽略「今日已写过」，强制写日志+状态
 """
 
 from __future__ import annotations
@@ -49,6 +56,9 @@ TZ = timezone(timedelta(hours=8))
 ROOT = Path(__file__).resolve().parent
 STATE_PATH = ROOT / "state.json"
 LOG_PATH = ROOT / "monitor_log.md"
+
+# 高频轮询时，同一类 warn / low 提醒多少小时内只发一次（high 级不受限）
+WARN_COOLDOWN_HOURS = 6
 
 UA = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -221,6 +231,33 @@ def check_backups() -> list[dict]:
 # ---------------------------------------------------------------- 状态与提醒
 
 
+def confirm_in(prev: dict, cur: dict, wait: int = 15) -> None:
+    """每分钟跑一次时，页面抖动很容易造成「有货」误报。
+
+    从无货变成有货的这一刻，隔 15 秒再看一眼：两次都说有货才算数，
+    否则以复查结果为准（一般会打回 oos，等于这次不报警、不提交）。
+    只在「刚变成有货」时触发，平时不多花时间。
+    """
+    for key, fn, name in (("five", check_five, FIVE_NAME), ("ccr", check_ccr, CCR_NAME)):
+        if cur[key]["status"] != "in":
+            continue
+        if (prev.get(key) or {}).get("status") == "in":
+            continue  # 上一轮就已经有货，不用复查
+        print(f"  {name} 首次发现现货，{wait} 秒后复查确认…")
+        time.sleep(wait)
+        try:
+            again = fn()
+        except Exception as exc:  # noqa: BLE001
+            print(f"  {name} 复查失败（{exc}），按首次结果处理，请人工确认")
+            continue
+        label = STATUS_TEXT.get(again["status"], again["status"])
+        if again["status"] == "in":
+            print(f"  {name} 复查通过，确认有货")
+        else:
+            print(f"  {name} 复查为「{label}」，判为页面抖动，本次不计")
+        cur[key] = again
+
+
 def load_state() -> dict:
     if STATE_PATH.exists():
         try:
@@ -232,6 +269,64 @@ def load_state() -> dict:
 
 def save_state(state: dict) -> None:
     STATE_PATH.write_text(json.dumps(state, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+
+
+def gh_output(pairs: dict) -> None:
+    """写 GitHub Actions 的 step output，让 workflow 决定要不要提交。
+
+    不在 Actions 里跑时（本地）静默跳过。
+    """
+    path = os.getenv("GITHUB_OUTPUT")
+    if not path:
+        return
+    try:
+        with open(path, "a", encoding="utf-8") as f:
+            for k, v in pairs.items():
+                if isinstance(v, bool):
+                    v = "true" if v else "false"
+                f.write(f"{k}={v}\n")
+    except Exception as exc:  # noqa: BLE001
+        print(f"  写 GITHUB_OUTPUT 失败：{exc}")
+
+
+def apply_cooldown(
+    alerts: list[tuple[str, str]],
+    prev: dict,
+    now: datetime,
+    hours: int = WARN_COOLDOWN_HOURS,
+) -> tuple[list[tuple[str, str]], dict]:
+    """高频轮询专用：warn / low 同类提醒 N 小时内只留一条，high 全部放行。
+
+    每分钟跑一次时，页面抖动（偶发 500、CDN 回源、临时改版）会让同一类警告
+    反复触发。high（真的上货了）必须第一时间发，不能压。
+    返回 (过滤后的 alerts, 要写回 state 的「已提醒时间表」)。
+    """
+    kept: dict[str, str] = {}
+    cutoff = now - timedelta(days=7)  # 7 天前的记录直接清掉，防止文件一直变大
+    for key, stamp in (prev.get("alerted") or {}).items():
+        try:
+            if datetime.fromisoformat(stamp) > cutoff:
+                kept[key] = stamp
+        except Exception:  # noqa: BLE001
+            continue
+
+    result: list[tuple[str, str]] = []
+    for level, msg in alerts:
+        if level == "high":
+            result.append((level, msg))
+            continue
+        key = f"{level}:{msg[:30]}"
+        last = kept.get(key)
+        if last:
+            try:
+                if now - datetime.fromisoformat(last) < timedelta(hours=hours):
+                    print(f"  同类提醒 {hours} 小时内已发过，跳过：{msg[:34]}")
+                    continue
+            except Exception:  # noqa: BLE001
+                pass
+        kept[key] = now.isoformat(timespec="seconds")
+        result.append((level, msg))
+    return result, kept
 
 
 def decide_alerts(prev: dict, cur: dict) -> list[tuple[str, str]]:
@@ -261,15 +356,24 @@ def decide_alerts(prev: dict, cur: dict) -> list[tuple[str, str]]:
     return alerts
 
 
-def append_log(now: datetime, cur: dict, alerts: list[tuple[str, str]]) -> None:
+def append_log(
+    now: datetime,
+    cur: dict,
+    alerts: list[tuple[str, str]],
+    note: str | None = None,
+) -> None:
+    if note is None:
+        note = "；".join(a[1] for a in alerts) if alerts else "无变化"
     row = (
         f"| {now.strftime('%Y-%m-%d %H:%M')} "
         f"| {STATUS_TEXT.get(cur['five']['status'], cur['five']['status'])} "
         f"| {STATUS_TEXT.get(cur['ccr']['status'], cur['ccr']['status'])} "
-        f"| {('；'.join(a[1] for a in alerts)) if alerts else '无变化'} |\n"
+        f"| {note} |\n"
     )
     header = (
         "# 补货监控日志（云端 GitHub Actions 自动写入）\n\n"
+        "> 每分钟检查一次，但只在**状态变化**或**每天第一次运行**时写一行，\n"
+        "> 所以这张表约等于「每日快照 + 变化流水」，不会一天几百行。\n\n"
         "| 时间（GMT+8） | 五大唱片 | 佳佳唱片 | 备注 |\n"
         "|---|---|---|---|\n"
     )
@@ -467,9 +571,15 @@ def main() -> int:
         subject, text, html = build_mail(now, cur, [("low", "这是一封测试邮件，用于验证 SMTP 配置是否可用。")], [])
         send_mail("[测试] " + subject, text, html)
         print("测试邮件已发送。")
+        gh_output({"commit": "false", "changed": "false", "reason": "test-email"})
         return 0
 
+    # 高频轮询下先确认「有货」不是页面抖动
+    confirm_in(prev, cur)
+    cur["ship_date"] = (cur.get("five") or {}).get("ship_date")
+
     alerts = decide_alerts(prev, cur)
+    alerts, alerted = apply_cooldown(alerts, prev, now)
     print(f"  变化：{alerts if alerts else '无'}")
 
     need_mail = bool(alerts) or force_email
@@ -482,15 +592,7 @@ def main() -> int:
         for b in backups:
             print(f"    {b['name']}: {b['state']}")
 
-    # 连续抓取失败两次才发告警，避免偶发网络问题刷屏
-    both_error = all(cur[k]["status"] == "error" for k in ("five", "ccr"))
-    error_streak = int(prev.get("error_streak") or 0)
-    error_streak = error_streak + 1 if both_error else 0
-    cur["error_streak"] = error_streak
-    if both_error and error_streak == 2:
-        alerts.append(("warn", "连续两轮两家都抓取失败，请检查网络或页面是否改版"))
-        need_mail = True
-
+    mail_ok = True
     if need_mail:
         subject, text, html = build_mail(now, cur, alerts, backups)
         if dry_run:
@@ -505,26 +607,74 @@ def main() -> int:
                 send_mail(subject, text, html)
                 print(f"  已发送邮件：{subject}")
             except Exception as exc:  # noqa: BLE001
+                mail_ok = False
                 print(f"  邮件发送失败：{exc}")
                 print(text)
     else:
         print("  无变化，不发送邮件")
 
+    # ---------- 决定这一次要不要写日志 / 提交 ----------
+    # 每分钟跑一次，若每次都写，一天就是 1440 个 commit。
+    # 所以：有变化 → 写（不写下一分钟会重复发信）；无变化 → 今天第一次运行时写一次快照。
+    today = now.strftime("%Y-%m-%d")
+    snapshot_due = prev.get("last_write_date") != today
+    force_write = "--force-write" in args or os.getenv("FORCE_WRITE", "").lower() in ("1", "true", "yes")
+    changed = bool(alerts)
+
+    if not mail_ok:
+        write_repo = False
+        reason = "邮件发送失败，保留旧状态等下一轮重试"
+    elif changed:
+        write_repo = True
+        reason = "状态有变化"
+    elif snapshot_due:
+        write_repo = True
+        reason = "每日快照"
+    elif force_write:
+        write_repo = True
+        reason = "手动强制写入"
+    else:
+        write_repo = False
+        reason = "无变化且今日已写过，不碰仓库"
+
+    print(f"  仓库写入：{'是' if write_repo else '否'}（{reason}）")
+
     if dry_run:
         print("（dry-run：不写入 state.json / monitor_log.md）")
+        gh_output(
+            {
+                "commit": False,
+                "changed": changed,
+                "reason": "dry-run",
+                "five": cur["five"]["status"],
+                "ccr": cur["ccr"]["status"],
+            }
+        )
         return 0
 
-    append_log(now, cur, alerts)
-    save_state(
+    if write_repo:
+        append_log(now, cur, alerts, note=None if changed else "无变化（每日快照）")
+        save_state(
+            {
+                "last_run": now.isoformat(timespec="seconds"),
+                "last_write_date": today,
+                "five": cur["five"],
+                "ccr": cur["ccr"],
+                "ship_date": cur["ship_date"],
+                "alerted": alerted,
+            }
+        )
+        print("  已更新 monitor_log.md 与 state.json")
+
+    gh_output(
         {
-            "last_run": now.isoformat(timespec="seconds"),
-            "five": cur["five"],
-            "ccr": cur["ccr"],
-            "ship_date": cur["ship_date"],
-            "error_streak": error_streak,
+            "commit": write_repo,
+            "changed": changed,
+            "reason": reason,
+            "five": cur["five"]["status"],
+            "ccr": cur["ccr"]["status"],
         }
     )
-    print("  状态已保存")
     return 0
 
 
