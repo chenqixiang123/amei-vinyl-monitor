@@ -1,6 +1,6 @@
 {
-  "last_run": "2026-11-22T11:50:14+08:00",
-  "last_write_date": "2026-11-22",
+  "last_run": "2026-11-23T00:00:14+08:00",
+  "last_write_date": "2026-11-23",
   "five": {
     "status": "oos",
     "note": "",
@@ -12,6 +12,12 @@
     "note": "",
     "price": "NT$1,840",
     "ship_date": null
+  },
+  "rock": {
+    "status": "oos",
+    "note": "",
+    "price": "NT$1,840",
+    "ship_date": "2026-10-02"
   },
   "ship_date": "2026-10-02",
   "alerted": {}
