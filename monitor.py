@@ -74,10 +74,15 @@ FIVE_URL = "https://www.5music.com.tw/CDList-C.asp?cdno=439405678604"
 CCR_NAME = "佳佳唱片"
 CCR_URL = "https://www.ccr.com.tw/goods/357085"
 
-# 主监控确认有货时才扫描的备用通路
+ROCK_NAME = "滾石購物網"
+ROCK_URL = "https://shop.rockmall.com.tw/product_view.php?id=100084"
+
+# 只在「本商品的購物車區塊」里认这几个字样，避免被页面推荐位里别的商品的按钮骗到
+CART_LABELS = ("加入購物車", "放入購物車", "加入購物车", "立即購買", "直接購買")
+
+# 主监控确认有货时才扫描的备用通路（滾石已升级为正式监控通路，见 CHANNELS）
 BACKUPS = [
     ("風谷購物網（环球官方）", "https://www.fangoods.com.tw/UMG/Default.aspx?ItemId=10291"),
-    ("滾石購物網", "https://shop.rockmall.com.tw/product_view.php?id=100084"),
     ("老頭音樂", "https://www.lowrecordstw.com/products/amei-story-thief-lp.json"),
     ("小白兔唱片", "https://wwr.com.tw/albums/0602567103400"),
     ("博客來", "https://www.books.com.tw/products/0020204179"),
@@ -198,6 +203,83 @@ def check_ccr() -> dict:
     return parse_ccr(http_get(CCR_URL))
 
 
+# ---------------------------------------------------------------- 滾石購物網
+# 页面是 365shop 的商城模板，坑比较多：
+#   - 售完时不显示「加入購物車」，只有一个 disabled 的「售完」按钮
+#   - 但整页别处（推荐位、隐藏模板）也可能出现「購物車」字样，按整页匹配会误判
+# 所以只看 id="product_mobile_show_box" 到 </form> 之间的「本商品购物车区块」。
+
+
+def _rock_cart_zone(html: str) -> str:
+    """切出本商品的购买区，找不到就返回空串。"""
+    m = re.search(r'id="product_mobile_show_box"', html)
+    if not m:
+        return ""
+    end = html.find("</form>", m.start())
+    return html[m.start() : end if end != -1 else m.start() + 8000]
+
+
+def _has_enabled_cart(html: str) -> bool:
+    """区块里是否存在「没被 disabled」的购物车按钮。"""
+    for mo in re.finditer(r"<(button|a|input)\b[^>]*>", html, flags=re.I):
+        tag = mo.group(0)
+        low = tag.lower()
+        if "disabled" in low or "not-allowed" in low:
+            continue
+        hay = tag + html[mo.end() : mo.end() + 60]
+        if any(k in hay for k in CART_LABELS):
+            return True
+    return False
+
+
+def parse_rock(html: str) -> dict:
+    """纯解析，不联网，便于单元测试。"""
+    plain = text_of(html)
+    if PRODUCT not in plain and "6710340" not in plain:
+        return {"status": "unknown", "note": "页面未出现商品名，可能改版或拦截", "price": None, "ship_date": None}
+
+    zone = _rock_cart_zone(html)
+    if not zone:
+        return {"status": "unknown", "note": "找不到购物车区块，页面可能改版", "price": grab_price(plain), "ship_date": None}
+
+    # 「售完」是页面上真实可见的按钮文字，优先采信
+    sold = "售完" in zone or "已售完" in zone
+
+    if sold:
+        status, note = "oos", ""
+    elif _has_enabled_cart(zone):
+        status, note = "in", ""
+    else:
+        status, note = "unknown", "购物车区块里既没「售完」也没可用按钮"
+
+    ship = None
+    m = re.search(r"【預定發行】\s*(20\d{2})[.\-/](\d{1,2})[.\-/](\d{1,2})", plain)
+    if m:
+        ship = f"{m.group(1)}-{int(m.group(2)):02d}-{int(m.group(3)):02d}"
+
+    return {"status": status, "note": note, "price": grab_price(plain) or LIST_PRICE, "ship_date": ship}
+
+
+def check_rock() -> dict:
+    return parse_rock(http_get(ROCK_URL))
+
+
+# 正式监控的通路：顺序决定邮件表格和日志列的顺序
+def channels() -> tuple:
+    """写成函数而不是常量——单元测试要能替换 check_five / check_ccr / check_rock。"""
+    return (
+        ("five", FIVE_NAME, check_five),
+        ("ccr", CCR_NAME, check_ccr),
+        ("rock", ROCK_NAME, check_rock),
+    )
+
+
+CHANNEL_URLS = {"five": FIVE_URL, "ccr": CCR_URL, "rock": ROCK_URL}
+
+# 日志表里状态列的顺序与表头
+LOG_STATUS_KEYS = ("five", "ccr", "rock")
+
+
 def check_backups() -> list[dict]:
     """只在主监控出现有货时调用，结果作为邮件的补充信息。"""
     results = []
@@ -238,7 +320,7 @@ def confirm_in(prev: dict, cur: dict, wait: int = 15) -> None:
     否则以复查结果为准（一般会打回 oos，等于这次不报警、不提交）。
     只在「刚变成有货」时触发，平时不多花时间。
     """
-    for key, fn, name in (("five", check_five, FIVE_NAME), ("ccr", check_ccr, CCR_NAME)):
+    for key, name, fn in channels():
         if cur[key]["status"] != "in":
             continue
         if (prev.get(key) or {}).get("status") == "in":
@@ -333,7 +415,7 @@ def decide_alerts(prev: dict, cur: dict) -> list[tuple[str, str]]:
     """返回 [(级别, 说明)]。级别：high / warn / low。"""
     alerts: list[tuple[str, str]] = []
 
-    for key, name in (("five", FIVE_NAME), ("ccr", CCR_NAME)):
+    for key, name, _fn in channels():
         old = (prev.get(key) or {}).get("status")
         new = cur[key]["status"]
         if new == "in" and old != "in":
@@ -356,6 +438,44 @@ def decide_alerts(prev: dict, cur: dict) -> list[tuple[str, str]]:
     return alerts
 
 
+LOG_INTRO = (
+    "# 补货监控日志（云端 GitHub Actions 自动写入）\n\n"
+    "> 每分钟检查一次，但只在**状态变化**或**每天第一次运行**时写一行，\n"
+    "> 所以这张表约等于「每日快照 + 变化流水」，不会一天几百行。\n\n"
+)
+LOG_HEAD_ROW = "| 时间（GMT+8） | 五大唱片 | 佳佳唱片 | 滾石購物網 | 备注 |"
+LOG_TABLE_HEAD = LOG_HEAD_ROW + "\n|---|---|---|---|---|\n"
+
+
+def _log_cells(line: str) -> list[str] | None:
+    s = line.strip()
+    if not s.startswith("|"):
+        return None
+    return [c.strip() for c in s.strip("|").split("|")]
+
+
+def migrate_log(content: str) -> str:
+    """老日志只有两列状态。补上滾石列（旧行填「—」），顺手把表头换成新的。"""
+    if LOG_HEAD_ROW in content:
+        return content
+    rows: list[str] = []
+    for line in content.splitlines():
+        cells = _log_cells(line)
+        if cells is None:
+            continue
+        if "GMT+8" in cells[0] or cells[0] == "时间":
+            continue  # 老表头行，不能当数据行
+        if all(c and set(c) <= set("-: ") for c in cells):
+            continue  # 分隔行
+        if len(cells) == 4:  # 时间 / 五大 / 佳佳 / 备注
+            cells = cells[:3] + ["—"] + cells[3:]
+        rows.append("| " + " | ".join(cells) + " |")
+    out = LOG_INTRO + LOG_TABLE_HEAD
+    if rows:
+        out += "\n".join(rows) + "\n"
+    return out
+
+
 def append_log(
     now: datetime,
     cur: dict,
@@ -364,28 +484,21 @@ def append_log(
 ) -> None:
     if note is None:
         note = "；".join(a[1] for a in alerts) if alerts else "无变化"
-    row = (
-        f"| {now.strftime('%Y-%m-%d %H:%M')} "
-        f"| {STATUS_TEXT.get(cur['five']['status'], cur['five']['status'])} "
-        f"| {STATUS_TEXT.get(cur['ccr']['status'], cur['ccr']['status'])} "
-        f"| {note} |\n"
-    )
-    header = (
-        "# 补货监控日志（云端 GitHub Actions 自动写入）\n\n"
-        "> 每分钟检查一次，但只在**状态变化**或**每天第一次运行**时写一行，\n"
-        "> 所以这张表约等于「每日快照 + 变化流水」，不会一天几百行。\n\n"
-        "| 时间（GMT+8） | 五大唱片 | 佳佳唱片 | 备注 |\n"
-        "|---|---|---|---|\n"
-    )
+
+    cells = [now.strftime("%Y-%m-%d %H:%M")]
+    cells += [STATUS_TEXT.get(cur[k]["status"], cur[k]["status"]) for k in LOG_STATUS_KEYS]
+    cells.append(note)
+    row = "| " + " | ".join(cells) + " |\n"
+
     if not LOG_PATH.exists():
-        LOG_PATH.write_text(header + row, encoding="utf-8")
+        LOG_PATH.write_text(LOG_INTRO + LOG_TABLE_HEAD + row, encoding="utf-8")
         return
 
-    content = LOG_PATH.read_text(encoding="utf-8")
-    marker = "|---|---|---|---|\n"
+    content = migrate_log(LOG_PATH.read_text(encoding="utf-8"))
+    marker = "|---|---|---|---|---|\n"
     idx = content.find(marker)
     if idx == -1:  # 文件被改坏了，重建
-        LOG_PATH.write_text(header + row, encoding="utf-8")
+        LOG_PATH.write_text(LOG_INTRO + LOG_TABLE_HEAD + row, encoding="utf-8")
         return
     insert_at = idx + len(marker)
     LOG_PATH.write_text(content[:insert_at] + row + content[insert_at:], encoding="utf-8")
@@ -447,8 +560,9 @@ def build_mail(now: datetime, cur: dict, alerts: list[tuple[str, str]], backups:
         lines.append("")
 
     lines.append("当前状态：")
-    for key, name, url in (("five", FIVE_NAME, FIVE_URL), ("ccr", CCR_NAME, CCR_URL)):
+    for key, name, _fn in channels():
         d = cur[key]
+        url = CHANNEL_URLS[key]
         extra = f"，出货日期 {d['ship_date']}" if d.get("ship_date") else ""
         price = f"，{d['price']}" if d.get("price") else ""
         lines.append(f"  · {name}：{STATUS_TEXT.get(d['status'], d['status'])}{price}{extra}")
@@ -469,7 +583,8 @@ def build_mail(now: datetime, cur: dict, alerts: list[tuple[str, str]], backups:
 
     color = {"high": "#c0392b", "warn": "#b9770e", "low": "#5d6d7e"}
     rows = ""
-    for key, name, url in (("five", FIVE_NAME, FIVE_URL), ("ccr", CCR_NAME, CCR_URL)):
+    for key, name, _fn in channels():
+        url = CHANNEL_URLS[key]
         d = cur[key]
         state = STATUS_TEXT.get(d["status"], d["status"])
         badge_bg = "#c0392b" if d["status"] == "in" else ("#7f8c8d" if d["status"] in ("oos",) else "#b9770e")
@@ -553,7 +668,7 @@ def main() -> int:
     prev = load_state()
     cur: dict = {"checked_at": now.isoformat(timespec="seconds"), "ship_date": None}
 
-    for key, fn, name in (("five", check_five, FIVE_NAME), ("ccr", check_ccr, CCR_NAME)):
+    for key, name, fn in channels():
         try:
             result = fn()
             cur[key] = result
@@ -583,7 +698,7 @@ def main() -> int:
     print(f"  变化：{alerts if alerts else '无'}")
 
     need_mail = bool(alerts) or force_email
-    any_in = any(cur[k]["status"] == "in" for k in ("five", "ccr"))
+    any_in = any(cur[k]["status"] == "in" for k, _n, _f in channels())
 
     backups = []
     if any_in:
@@ -648,6 +763,7 @@ def main() -> int:
                 "reason": "dry-run",
                 "five": cur["five"]["status"],
                 "ccr": cur["ccr"]["status"],
+                "rock": cur["rock"]["status"],
             }
         )
         return 0
@@ -660,6 +776,7 @@ def main() -> int:
                 "last_write_date": today,
                 "five": cur["five"],
                 "ccr": cur["ccr"],
+                "rock": cur["rock"],
                 "ship_date": cur["ship_date"],
                 "alerted": alerted,
             }
