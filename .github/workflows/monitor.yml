@@ -71,7 +71,7 @@ jobs:
       - name: 小结
         if: always()
         run: |
-          echo "本次结果：五大=${{ steps.monitor.outputs.five }} / 佳佳=${{ steps.monitor.outputs.ccr }} / 有变化=${{ steps.monitor.outputs.changed }} / 提交=${{ steps.monitor.outputs.commit }} / 原因=${{ steps.monitor.outputs.reason }}"
+          echo "本次结果：五大=${{ steps.monitor.outputs.five }} / 佳佳=${{ steps.monitor.outputs.ccr }} / 滾石=${{ steps.monitor.outputs.rock }} / 有变化=${{ steps.monitor.outputs.changed }} / 提交=${{ steps.monitor.outputs.commit }} / 原因=${{ steps.monitor.outputs.reason }}"
 
       # 只有「状态变化」或「今天第一次运行（每日快照）」才提交，
       # 每分钟的其余 1400 多次运行完全不产生 commit
