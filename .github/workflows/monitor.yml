@@ -1,10 +1,8 @@
 name: 偷故事的人 黑胶补货监控
 
-# 主力触发：腾讯云函数每分钟调一次 workflow_dispatch（见 云函数定时触发.md）
-# 下面的 schedule 只是兜底，GitHub 自带定时器实测会延迟几个小时，不能当主力用
+# 唯一触发源：腾讯云函数每分钟调一次 workflow_dispatch（见 云函数定时触发.md）
+# 2026-11-23 已移除 GitHub 原生 on.schedule —— 实测会延迟数小时，是不可控的随机触发源
 on:
-  schedule:
-    - cron: "17 1,9 * * *" # UTC 01:17 / 09:17 = 台湾时间 09:17 / 17:17
   workflow_dispatch:
     inputs:
       dry_run:
