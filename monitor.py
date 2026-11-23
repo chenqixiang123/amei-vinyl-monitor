@@ -432,10 +432,25 @@ def decide_alerts(prev: dict, cur: dict) -> list[tuple[str, str]]:
     new_ship = cur.get("ship_date")
     if old_ship and new_ship and new_ship != old_ship:
         alerts.append(("high", f"{FIVE_NAME}「出貨日期」由 {old_ship} 改为 {new_ship}，很可能是第二批开放预购"))
-    if not old_ship and new_ship and prev:
+    prev_five = (prev.get("five") or {}).get("status")
+    if not old_ship and new_ship and prev and prev_five not in ("error", "unknown"):
         alerts.append(("low", f"首次记录到{FIVE_NAME}出货日期：{new_ship}"))
 
     return alerts
+
+
+def sync_ship_date(prev: dict, cur: dict) -> None:
+    """把五大的出货日期同步到 cur['ship_date']。
+
+    抓取失败时沿用上一次已知值。否则「失败 → 恢复」的下一轮里
+    old_ship 会是空的，会被误判成「首次记录到出货日期」并白发一封提醒
+    （2026-11-23 03:24 就这么误报过一次）。
+    """
+    five = cur.get("five") or {}
+    ship = five.get("ship_date")
+    if not ship and five.get("status") in ("error", "unknown"):
+        ship = prev.get("ship_date")
+    cur["ship_date"] = ship
 
 
 LOG_INTRO = (
@@ -677,7 +692,7 @@ def main() -> int:
             cur[key] = {"status": "error", "note": str(exc)[:200], "price": None, "ship_date": None}
             print(f"  {name}: 抓取失败 -> {exc}")
 
-    cur["ship_date"] = (cur.get("five") or {}).get("ship_date")
+    sync_ship_date(prev, cur)
 
     if test_email:
         if not smtp_configured():
@@ -691,7 +706,7 @@ def main() -> int:
 
     # 高频轮询下先确认「有货」不是页面抖动
     confirm_in(prev, cur)
-    cur["ship_date"] = (cur.get("five") or {}).get("ship_date")
+    sync_ship_date(prev, cur)
 
     alerts = decide_alerts(prev, cur)
     alerts, alerted = apply_cooldown(alerts, prev, now)
