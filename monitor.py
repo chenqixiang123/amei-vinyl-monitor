@@ -91,6 +91,7 @@ BACKUPS = [
 STATUS_TEXT = {
     "in": "有现货／可下单",
     "oos": "无货",
+    "gone": "已下架（商品页不存在）",
     "unknown": "无法判断（页面可能改版）",
     "error": "抓取失败",
 }
@@ -232,15 +233,43 @@ def _has_enabled_cart(html: str) -> bool:
     return False
 
 
-def parse_rock(html: str) -> dict:
-    """纯解析，不联网，便于单元测试。"""
-    plain = text_of(html)
-    if PRODUCT not in plain and "6710340" not in plain:
-        return {"status": "unknown", "note": "页面未出现商品名，可能改版或拦截", "price": None, "ship_date": None}
+def _rock_is_site_shell(html: str) -> bool:
+    """返回的是不是「站点首页／列表页」这种完整页面（而不是维护页、拦截页）。
 
+    实测：不存在的商品 id 返回的是完整首页（约 54k 字符、带 6 个其它商品链接）。
+    而维护页、Cloudflare 拦截页通常只有几百到几千字符。
+    两者都是「没商品名」，必须分开：前者是下架，后者是异常。
+    """
+    ids = set(re.findall(r"product_view\.php\?id=(\d+)", html))
+    return len(html) > 30000 and len(ids) >= 3
+
+
+def parse_rock(html: str) -> dict:
+    """纯解析，不联网，便于单元测试。
+
+    2026-11-24 起区分「商品已下架」与「页面改版／异常」：
+      实测 shop.rockmall.com.tw 对不存在的商品 id 不返回 404，而是返回站点首页
+      （约 54k 字符、有完整导航栏、无商品名、无 product_mobile_show_box）。
+      该响应与已下架商品 id 的响应几乎完全一致（54,115 vs 54,117 字符），
+      而真实在售的商品页都在 84k 字符以上、必带购物车区块。
+      判据因此是三条同时成立：没有商品名、没有购物车区块、返回的是完整站点页面。
+      缺少最后一条时（维护页／拦截页）仍判 unknown，避免把故障当成下架。
+    """
+    plain = text_of(html)
+    named = PRODUCT in plain or "6710340" in plain
     zone = _rock_cart_zone(html)
+
+    if not zone and not named and _rock_is_site_shell(html):
+        return {
+            "status": "gone",
+            "note": "服务器对该商品页返回的是站点首页（与不存在的商品 id 响应一致），商品应已下架",
+            "price": None,
+            "ship_date": None,
+        }
+    if not named:
+        return {"status": "unknown", "note": "页面未出现商品名，可能改版或拦截", "price": None, "ship_date": None}
     if not zone:
-        return {"status": "unknown", "note": "找不到购物车区块，页面可能改版", "price": grab_price(plain), "ship_date": None}
+        return {"status": "unknown", "note": "有商品名但找不到购物车区块，页面结构可能改版", "price": grab_price(plain), "ship_date": None}
 
     # 「售完」是页面上真实可见的按钮文字，优先采信
     sold = "售完" in zone or "已售完" in zone
@@ -423,6 +452,8 @@ def decide_alerts(prev: dict, cur: dict) -> list[tuple[str, str]]:
             alerts.append(("high", f"{name} 出现现货／可下单（{tag}）"))
         elif new == "unknown" and old != "unknown":
             alerts.append(("warn", f"{name} 页面状态无法判断，可能改版，需要人工看一眼"))
+        elif new == "gone" and old != "gone":
+            alerts.append(("warn", f"{name} 商品页已不存在，商品应已下架（如仍想要可留意是否重新上架）"))
         elif new == "error" and old != "error":
             alerts.append(("warn", f"{name} 本次抓取失败"))
         elif new == "oos" and old == "in":
@@ -433,7 +464,7 @@ def decide_alerts(prev: dict, cur: dict) -> list[tuple[str, str]]:
     if old_ship and new_ship and new_ship != old_ship:
         alerts.append(("high", f"{FIVE_NAME}「出貨日期」由 {old_ship} 改为 {new_ship}，很可能是第二批开放预购"))
     prev_five = (prev.get("five") or {}).get("status")
-    if not old_ship and new_ship and prev and prev_five not in ("error", "unknown"):
+    if not old_ship and new_ship and prev and prev_five not in ("error", "unknown", "gone"):
         alerts.append(("low", f"首次记录到{FIVE_NAME}出货日期：{new_ship}"))
 
     return alerts
@@ -448,7 +479,7 @@ def sync_ship_date(prev: dict, cur: dict) -> None:
     """
     five = cur.get("five") or {}
     ship = five.get("ship_date")
-    if not ship and five.get("status") in ("error", "unknown"):
+    if not ship and five.get("status") in ("error", "unknown", "gone"):
         ship = prev.get("ship_date")
     cur["ship_date"] = ship
 
@@ -602,7 +633,8 @@ def build_mail(now: datetime, cur: dict, alerts: list[tuple[str, str]], backups:
         url = CHANNEL_URLS[key]
         d = cur[key]
         state = STATUS_TEXT.get(d["status"], d["status"])
-        badge_bg = "#c0392b" if d["status"] == "in" else ("#7f8c8d" if d["status"] in ("oos",) else "#b9770e")
+        # 灰=确定的「没有」（无货 / 已下架），橙=不确定或异常（改版 / 抓取失败）
+        badge_bg = "#c0392b" if d["status"] == "in" else ("#7f8c8d" if d["status"] in ("oos", "gone") else "#b9770e")
         rows += (
             f'<tr><td style="padding:10px 12px;border-bottom:1px solid #e5e7eb;">'
             f'<a href="{url}" style="color:#1a5490;text-decoration:none;">{name}</a></td>'
