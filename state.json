@@ -1,10 +1,10 @@
 {
-  "last_run": "2026-11-26T01:45:07+08:00",
-  "last_write_date": "2026-11-26",
+  "last_run": "2026-11-27T00:00:21+08:00",
+  "last_write_date": "2026-11-27",
   "five": {
-    "status": "error",
-    "note": "抓取失败：<urlopen error timed out>",
-    "price": null,
+    "status": "oos",
+    "note": "",
+    "price": "NT$1,840",
     "ship_date": null
   },
   "ccr": {
@@ -14,10 +14,10 @@
     "ship_date": null
   },
   "rock": {
-    "status": "gone",
-    "note": "服务器对该商品页返回的是站点首页（与不存在的商品 id 响应一致），商品应已下架",
-    "price": null,
-    "ship_date": null
+    "status": "oos",
+    "note": "",
+    "price": "NT$1,840",
+    "ship_date": "2026-10-02"
   },
   "ship_date": null,
   "alerted": {
